@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🏋️ Healthy Fitness Coach
+# 🏋️ 健身私教 · Healthy Fitness Coach
 
 ### 面向普通健身人群的健康训练Skill
 
