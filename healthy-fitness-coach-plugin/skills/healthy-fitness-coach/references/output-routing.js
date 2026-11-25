@@ -2,6 +2,7 @@
 
 const { existsSync } = require('node:fs');
 const { basename, join, parse } = require('node:path');
+const { inspectSafety } = require('./safety-context.js');
 
 const CONVERSATION_TASKS = new Set([
   'today_workout',
@@ -30,6 +31,7 @@ const TASK_ASSETS = {
   training_review: ['WEEKLY_REVIEW.md', 'DECISION_LOG.md'],
   training_system: ['ATHLETE_PROFILE.md', 'TRAINING_DNA.md', 'CURRENT_PROGRAM.md', 'DECISION_LOG.md'],
   xunji_analysis: ['TRAINING_ANALYSIS.md'],
+  training_handoff: ['TRAINING_CHECKPOINT.json', 'TRAINING_HANDOFF.md'],
   share_output: ['SHARE_CARD.png', 'SHARE_FACTS.md']
 };
 
@@ -38,6 +40,7 @@ const TASK_INDEXES = {
   training_review: 'TRAINING_REVIEW_INDEX.md',
   training_system: 'TRAINING_SYSTEM_INDEX.md',
   xunji_analysis: 'XUNJI_ANALYSIS_INDEX.md',
+  training_handoff: 'TRAINING_HANDOFF_INDEX.md',
   share_output: 'SHARE_OUTPUT_INDEX.md'
 };
 
@@ -131,10 +134,21 @@ function explicitOverride(instruction) {
   } : null;
 }
 
-function routeOutput({ taskType, userInstruction, capabilities = {} } = {}) {
-  if (taskType === 'safety_routing') return { mode: 'conversation', reason: 'safety_override', override: null };
-  if (capabilities.can_write_files === false || capabilities.mobile === true) return { mode: 'conversation', reason: 'portable_summary', override: null };
+function routeOutput({ taskType, userInstruction, capabilities } = {}) {
+  if (taskType === 'safety_routing' || inspectSafety({ instruction: userInstruction }).status !== 'clear') {
+    return { mode: 'conversation', reason: 'safety_override', override: null };
+  }
   const override = explicitOverride(userInstruction);
+  const userRequestedAttachment = taskType === 'training_handoff' || taskType === 'share_output'
+    || (override && override.override !== 'enter_tracking');
+  const portable = { mode: 'conversation', reason: 'portable_summary', override: null };
+  if (capabilities && capabilities.can_write_files !== true) return portable;
+  if (capabilities?.mobile === true && !userRequestedAttachment) return portable;
+  if (taskType === 'training_handoff') {
+    return capabilities?.can_write_files === true
+      ? { mode: 'markdown', reason: 'explicit_handoff_export', override: null }
+      : portable;
+  }
   if (override) return override;
   if (MARKDOWN_TASKS.has(taskType)) return { mode: 'markdown', reason: 'default_task_type', override: null };
   return { mode: 'conversation', reason: 'default_task_type', override: null };
@@ -154,7 +168,7 @@ function resolveNonOverwritingPath(filename, { outputDirectory = 'fitness-report
   return candidate;
 }
 
-function planOutputAssets({ taskType, userInstruction, outputDirectory = 'fitness-reports', existingPaths = new Set(), capabilities = {} } = {}) {
+function planOutputAssets({ taskType, userInstruction, outputDirectory = 'fitness-reports', existingPaths = new Set(), capabilities } = {}) {
   const route = routeOutput({ taskType, userInstruction, capabilities });
   let artifacts = [];
   let index = null;
@@ -169,7 +183,8 @@ function planOutputAssets({ taskType, userInstruction, outputDirectory = 'fitnes
     artifacts = TASK_ASSETS[taskType] ? [...TASK_ASSETS[taskType]] : [];
   }
 
-  if (route.reason === 'portable_summary' || (route.mode === 'conversation' && taskType !== 'share_output')) {
+  if (route.reason === 'portable_summary' || route.reason === 'safety_override'
+    || (route.mode === 'conversation' && taskType !== 'share_output')) {
     artifacts = [];
   }
 

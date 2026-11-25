@@ -1,7 +1,7 @@
 'use strict';
 
 const { createHash, randomUUID } = require('node:crypto');
-const { OperationStore, memoryOperationStore } = require('./operation-store.js');
+const { OperationStore, memoryOperationStore, processIsAlive, versionOf } = require('./operation-store.js');
 const { join } = require('node:path');
 const { z } = require('zod');
 const { FileCache, credentialFingerprint } = require('./cache.js');
@@ -14,7 +14,7 @@ const { renderTrainingDashboardHtml } = require('./dashboard.js');
 const { buildVisualReportAssets } = require('./visual-report.js');
 const { analyzeTrainingRange, buildReviewFirstTrainingDNA } = require('./trends.js');
 const { compareTrainingDNA } = require('./training-dna.js');
-const { validateUpsertRecords } = require('./upsert.js');
+const { matchesReturnedRecords, validateUpsertRecords } = require('./upsert.js');
 const { decodeXunjiResponse, XunjiClient } = require('./xunji-client.js');
 
 const REFRESH_WINDOW_MS = 90_000;
@@ -57,15 +57,58 @@ function dateRangeChunks(startDate, endDate) {
   return chunks;
 }
 
+function submissionOutcome(entry) {
+  if (!entry) return 'not_submitted';
+  if (entry.outcome !== 'submitting') return entry.outcome;
+  return processIsAlive(entry.pid) ? 'submitting' : 'unknown';
+}
+
 function createTrainingService({ operationStore = null, cache = null, cacheFactory, dnaStore = null, client = new XunjiClient(), credentialProvider = readWindowsCredential, logger = null, now = Date.now, today = null, localAppData = process.env.LOCALAPPDATA } = {}) {
   const previews = new Map();
   const verifications = new Map();
   const operations = operationStore || (cache ? memoryOperationStore() : new OperationStore(join(localAppData || '.', 'HealthyFitnessCoach', 'write-operations')));
   const digest = (credential, records) => createHash('sha256').update(JSON.stringify([credentialFingerprint(credential), records])).digest('hex');
   const pending = new Map();
+  const dayQueues = new Map();
+  const dayVersions = new Map();
+  const invalidatedDays = new Set();
   const accountCaches = new Map();
   const accountDnaStores = new Map();
   const dnaPending = new Map();
+  const dayKey = (credential, date) => `${credentialFingerprint(credential)}:${date}`;
+
+  async function findSubmission(credential, records) {
+    // Compare submission batches as multisets. Keep the exact sequence for
+    // preview confirmation and the remote request.
+    const exactKey = digest(credential, records);
+    const batchKey = digest(credential, [...records].sort());
+    const entry = await operations.get(batchKey);
+    if (entry || exactKey === batchKey) return { batchKey, key: batchKey, entry };
+    // Older journals stored only the digest of the exact sequence.
+    const legacyEntry = await operations.get(exactKey);
+    return legacyEntry ? { batchKey, key: exactKey, entry: legacyEntry } : { batchKey, key: batchKey, entry: null };
+  }
+
+  async function withDay(key, action) {
+    const operation = (dayQueues.get(key) || Promise.resolve()).catch(() => {}).then(action);
+    dayQueues.set(key, operation);
+    try { return await operation; } finally { if (dayQueues.get(key) === operation) dayQueues.delete(key); }
+  }
+
+  async function saveUpsertEntry(date, key, store, entry, cacheRevision) {
+    dayVersions.set(key, (dayVersions.get(key) || 0) + 1);
+    try {
+      await store.set(date, entry, cacheRevision);
+      invalidatedDays.delete(key);
+      return true;
+    } catch (_) {
+      invalidatedDays.add(key);
+      entry.warnings.push('write_confirmed_cache_failed');
+      try { await store.delete?.(date, cacheRevision); } catch (_) { /* Recheck this date even if deletion fails. */ }
+      return false;
+    }
+  }
+
   const getCache = async (credential) => {
     // `cache` is a test-only single-store injection. Production always keys its
     // stores by the one-way credential fingerprint below.
@@ -111,10 +154,11 @@ function createTrainingService({ operationStore = null, cache = null, cacheFacto
     };
   };
 
-  async function fetchMissing(date, credential, store) {
-    const pendingKey = `${credentialFingerprint(credential)}:${date}`;
+  async function fetchMissing(date, credential, store, key, version, snapshot) {
+    const pendingKey = `${key}:${version}:${snapshot.version}`;
     if (pending.has(pendingKey)) return pending.get(pendingKey);
     const operation = (async () => {
+      let entry, fetchError;
       try {
         const response = await client.fetchDay(date, credential);
         const decoded = response && Array.isArray(response.records) ? response : decodeXunjiResponse(response);
@@ -122,13 +166,27 @@ function createTrainingService({ operationStore = null, cache = null, cacheFacto
         const filtered = filterModelFacingRecords(parsed);
         const safeRecords = filtered.filter((record) => !record.warnings?.includes('invalid_date') && record.record_date === date);
         const warnings = [...filtered.warnings, ...parsed.flatMap((record) => record.warnings || []), ...(safeRecords.length !== filtered.length ? [`cross_date_records_dropped:${filtered.length - safeRecords.length}`] : [])];
-        const entry = { fetched_at: now(), records: safeRecords, warnings };
-        await store.set(date, entry);
+        entry = { fetched_at: now(), records: safeRecords, warnings };
+      } catch (error) {
+        fetchError = error;
+      }
+      return withDay(key, async () => {
+        if ((dayVersions.get(key) || 0) !== version) return { superseded: true };
+        if (store.isSnapshotCurrent && !await store.isSnapshotCurrent(date, snapshot.version)) return { superseded: true };
+        if (fetchError) return { error: toPublicError(fetchError) };
+        try {
+          if (store.saveSnapshot) {
+            if (!await store.saveSnapshot(date, entry, snapshot)) return { superseded: true };
+          } else {
+            await store.set(date, entry);
+          }
+          invalidatedDays.delete(key);
+        } catch (_) {
+          entry.warnings.push('read_cache_save_failed');
+        }
         if (logger && typeof logger.info === 'function') logger.info('xunji_training_day_fetched', { date });
         return resultFromEntry(date, entry, false, 1);
-      } catch (error) {
-        return { error: toPublicError(error) };
-      }
+      });
     })();
     pending.set(pendingKey, operation);
     try { return await operation; } finally { pending.delete(pendingKey); }
@@ -139,26 +197,40 @@ function createTrainingService({ operationStore = null, cache = null, cacheFacto
       assertDate(date);
       const credential = credentialOverride || await credentialProvider();
       const store = await getCache(credential);
-      const entry = await store.get(date);
-      if (entry) {
-        const elapsed = now() - entry.fetched_at;
-        if (refresh && elapsed >= 0 && elapsed < REFRESH_WINDOW_MS) {
-          return { error: toPublicError(Object.assign(new Error('rate limited'), { code: 'rate_limited', retry_after_seconds: (REFRESH_WINDOW_MS - elapsed) / 1000 })) };
+      const key = dayKey(credential, date);
+      let discardedFetches = 0;
+      while (true) {
+        const { snapshot, version } = await withDay(key, async () => {
+          const invalidated = invalidatedDays.has(key);
+          const snapshot = store.readSnapshot
+            ? await store.readSnapshot(date, invalidated)
+            : { entry: invalidated ? null : await store.get(date), version: null };
+          return { snapshot, version: dayVersions.get(key) || 0 };
+        });
+        const { entry } = snapshot;
+        if (entry) {
+          const elapsed = now() - entry.fetched_at;
+          if (refresh && elapsed >= 0 && elapsed < REFRESH_WINDOW_MS) {
+            return { error: toPublicError(Object.assign(new Error('rate limited'), { code: 'rate_limited', retry_after_seconds: (REFRESH_WINDOW_MS - elapsed) / 1000 })) };
+          }
+          const todayDate = today ? today() : currentShanghaiDate(now());
+          const ageDays = (Date.parse(todayDate) - Date.parse(date)) / 86400000;
+          const recentExpired = ageDays >= 0 && ageDays < 7 && elapsed >= 300000;
+          if (!refresh && !recentExpired) return resultFromEntry(date, entry, true, discardedFetches);
         }
-        const todayDate = today ? today() : currentShanghaiDate(now());
-        const ageDays = (Date.parse(todayDate) - Date.parse(date)) / 86400000;
-        const recentExpired = ageDays >= 0 && ageDays < 7 && elapsed >= 300000;
-        if (!refresh && !recentExpired) return resultFromEntry(date, entry, true, 0);
-        const refreshed = await fetchMissing(date, credential, store);
-        if (refreshed.error) {
-          if (['missing_credentials', 'invalid_credentials', 'membership_required'].includes(refreshed.error.code)) return refreshed;
-          const fallback = resultFromEntry(date, entry, true, 0);
+        const refreshed = await fetchMissing(date, credential, store, key, version, snapshot);
+        if (refreshed.superseded) {
+          discardedFetches += 1;
+          refresh = false;
+          continue;
+        }
+        if (entry && refreshed.error && !['missing_credentials', 'invalid_credentials', 'membership_required'].includes(refreshed.error.code)) {
+          const fallback = resultFromEntry(date, entry, true, discardedFetches);
           fallback.warnings = [...fallback.warnings, 'refresh_failed_using_cache'];
           return fallback;
         }
-        return refreshed;
+        return refreshed.error ? refreshed : { ...refreshed, network_fetches: refreshed.network_fetches + discardedFetches };
       }
-      return await fetchMissing(date, credential, store);
     } catch (error) {
       return { error: toPublicError(error) };
     }
@@ -197,65 +269,98 @@ function createTrainingService({ operationStore = null, cache = null, cacheFacto
     try {
       const validated = validateUpsertRecords(records);
       const credential = await credentialProvider();
-      const key = digest(credential, records);
+      const fingerprint = digest(credential, validated.records);
+      const { key, entry } = await findSubmission(credential, validated.records);
+      const outcome = submissionOutcome(entry);
       for (const [id, preview] of previews) if (preview.expires_at <= now()) previews.delete(id);
       const preview_id = randomUUID();
       const expires_at = now() + 600000;
-      previews.set(preview_id, { key, expires_at });
+      previews.set(preview_id, { fingerprint, key, version: versionOf(entry), expires_at });
       return { date: validated.date, record_count: records.length, existing_ids: validated.existing_ids,
         new_records: validated.new_records, records: validated.records, parsed: validated.parsed,
-        preview_id, expires_at, previous_submission: await operations.get(key) || null, requires_confirmation: true };
+        preview_id, expires_at, requires_confirmation: true,
+        previous_submission: outcome === 'not_submitted' ? null : {
+          outcome, date: entry.date, submitted_at: entry.submitted_at, confirmed_at: entry.confirmed_at
+        } };
     } catch (error) { return { error: toPublicError(error) }; }
   }
 
   async function upsertTrainingRecords({ records, confirm = false, preview_id } = {}) {
     if (confirm !== true) return { outcome: 'not_submitted', error: toPublicError(connectorError('writeback_not_confirmed')) };
-    let key, validated, store;
-    let submitted = false;
     try {
-      validated = validateUpsertRecords(records);
+      const validated = validateUpsertRecords(records);
       const credential = await credentialProvider();
-      key = digest(credential, records);
       const preview = previews.get(preview_id);
-      if (!preview || preview.key !== key || preview.expires_at <= now()) throw connectorError('preview_required');
-      store = await getCache(credential);
-      // Durable claim happens before sending; a crash leaves an unknown result, never a safe automatic retry.
-      if (!await operations.claim(key, { outcome: 'unknown', date: validated.date, submitted_at: now() }))
-        return { outcome: 'reconciliation_required', error: toPublicError(connectorError('reconciliation_required')) };
-      submitted = true;
-      const response = await client.upsertRecords(validated.records, credential);
-      const decoded = response && Array.isArray(response.records) ? response : decodeXunjiResponse(response);
-      const parsed = parseTrainingRecords(decoded.records);
-      if (!parsed.length || parsed.some(record => !record.record_date || record.record_date !== validated.date || record.warnings?.includes('invalid_date'))) throw connectorError('invalid_response');
-      const safeRecords = filterModelFacingRecords(parsed);
-      const warnings = [...safeRecords.warnings, ...parsed.flatMap(record => record.warnings || [])];
-      const entry = { fetched_at: now(), records: safeRecords, warnings, last_operation: 'upsert' };
-      let cache_saved = true;
-      try { await store.set(validated.date, entry); } catch (_) { cache_saved = false; warnings.push('write_confirmed_cache_failed'); }
-      try { await operations.set(key, { outcome: 'confirmed', date: validated.date, confirmed_at: now() }); }
-      catch (_) { warnings.push('write_confirmed_journal_update_failed'); }
-      return { ...resultFromEntry(validated.date, entry, false, 1), outcome: 'confirmed', writeback: true,
-        cache_saved, upserted_records: records.length, server_records: safeRecords };
+      if (!preview || preview.fingerprint !== digest(credential, validated.records) || preview.expires_at <= now()) throw connectorError('preview_required');
+      const store = await getCache(credential);
+      const date = validated.date;
+      const cacheKey = dayKey(credential, date);
+      return await withDay(cacheKey, async () => {
+        if (preview.expires_at <= now()) throw connectorError('preview_required');
+        const { batchKey, key, entry: previous } = await findSubmission(credential, validated.records);
+        if (submissionOutcome(previous) !== 'not_submitted')
+          return { outcome: 'reconciliation_required', error: toPublicError(connectorError('reconciliation_required')) };
+        if (preview.key !== key || preview.version !== versionOf(previous)) throw connectorError('preview_required');
+        const expectedVersion = batchKey === key ? versionOf(previous) : null;
+        const write = (epoch) => sendTrainingUpsert({ validated, credential, batchKey, expectedVersion, store, cacheKey, epoch });
+        return store.withWriteRevision ? store.withWriteRevision(date, write) : write();
+      });
     } catch (error) {
-      const rejected = ['invalid_credentials', 'membership_required', 'rate_limited'].includes(error.code);
-      if (submitted && rejected) { try { await operations.remove(key); } catch (_) {} }
-      return { outcome: submitted && !rejected ? 'unknown' : 'not_submitted',
-        error: toPublicError(submitted && !rejected ? connectorError('writeback_unknown') : error) };
+      return { outcome: 'not_submitted', error: toPublicError(error) };
     }
+  }
+
+  async function sendTrainingUpsert({ validated, credential, batchKey, expectedVersion, store, cacheKey, epoch }) {
+    const { date, records } = validated;
+    // Durable claim happens before sending; a crash cannot make a retry safe.
+    const attempt = { outcome: 'submitting', date, submitted_at: now(), version: randomUUID(), pid: process.pid };
+    if (!await operations.transition(batchKey, expectedVersion, attempt))
+      return { outcome: 'reconciliation_required', error: toPublicError(connectorError('reconciliation_required')) };
+    const settle = (outcome) => operations.transition(batchKey, attempt.version, {
+      outcome, date, version: randomUUID(), submitted_at: attempt.submitted_at,
+      ...(outcome === 'confirmed' ? { confirmed_at: now() } : {})
+    });
+    let parsed, safeRecords;
+    try {
+      const response = await client.upsertRecords(records, credential);
+      const decoded = response && Array.isArray(response.records) ? response : decodeXunjiResponse(response);
+      parsed = parseTrainingRecords(decoded.records);
+      if (!parsed.length || parsed.some(record => record.record_date !== date || record.warnings?.includes('invalid_date'))) throw connectorError('invalid_response');
+      if (!matchesReturnedRecords(validated, parsed)) throw connectorError('invalid_response');
+      safeRecords = filterModelFacingRecords(parsed);
+    } catch (error) {
+      const rejected = ['invalid_credentials', 'membership_required', 'rate_limited'].includes(error?.code);
+      const outcome = rejected ? 'not_submitted' : 'unknown';
+      await settle(outcome).catch(() => {});
+      return { outcome, error: toPublicError(rejected ? error : connectorError('writeback_unknown')) };
+    }
+    const warnings = [...safeRecords.warnings, ...parsed.flatMap(record => record.warnings || [])];
+    const entry = { fetched_at: now(), records: safeRecords, warnings, last_operation: 'upsert' };
+    if (!await settle('confirmed').catch(() => false)) warnings.push('write_confirmed_journal_update_failed');
+    const cache_saved = await saveUpsertEntry(date, cacheKey, store, entry, epoch);
+    return { ...resultFromEntry(date, entry, false, 1), outcome: 'confirmed', writeback: true,
+      cache_saved, upserted_records: records.length, server_records: safeRecords };
   }
 
   async function reconcileTrainingUpsert({ records, verification_id, confirm_not_applied = false } = {}) {
     try {
       const validated = validateUpsertRecords(records);
       const credential = await credentialProvider();
-      const key = digest(credential, records);
-      if (confirm_not_applied) {
+      const { key, entry } = await findSubmission(credential, validated.records);
+      const submission = submissionOutcome(entry);
+      if (submission === 'confirmed') return { outcome: 'confirmed', writeback: false, confirmed_at: entry.confirmed_at };
+      if (submission === 'submitting') return { outcome: 'submitting', writeback: false };
+      const version = versionOf(entry);
+      if (confirm_not_applied === true) {
         const proof = verifications.get(verification_id);
-        if (!proof || proof.key !== key || proof.expires_at <= now()) throw connectorError('reconciliation_required');
-        await operations.remove(key);
+        if (submission !== 'unknown' || !proof || proof.key !== key || proof.version !== version || proof.expires_at <= now())
+          throw connectorError('reconciliation_required');
         verifications.delete(verification_id);
+        if (!await operations.transition(key, version, { outcome: 'not_submitted', date: validated.date, version: randomUUID() }))
+          throw connectorError('reconciliation_required');
         return { outcome: 'verified_not_applied', next: 'create_new_preview_and_confirm', writeback: false };
       }
+      if (submission !== 'unknown') return { outcome: 'not_submitted', writeback: false };
       // Reconciliation must read the server, not a possibly stale cache.
       const response = await client.fetchDay(validated.date, credential);
       const decoded = response && Array.isArray(response.records) ? response : decodeXunjiResponse(response);
@@ -264,9 +369,10 @@ function createTrainingService({ operationStore = null, cache = null, cacheFacto
       const safeRecords = filterModelFacingRecords(parsed);
       if (safeRecords.warnings.length || parsed.some(record => record.warnings?.length))
         return { outcome: 'needs_manual_verification', records: safeRecords, can_clear_submission: false };
+      if (versionOf(await operations.get(key)) !== version) throw connectorError('reconciliation_required');
       for (const [id, proof] of verifications) if (proof.expires_at <= now()) verifications.delete(id);
       const id = randomUUID();
-      verifications.set(id, { key, expires_at: now() + 300000 });
+      verifications.set(id, { key, version, expires_at: now() + 300000 });
       return { outcome: 'needs_user_verification', date: validated.date, records: safeRecords,
         verification_id: id, fetched_at: now(), next: 'compare_records_do_not_automatically_resubmit' };
     } catch (error) { return { error: toPublicError(error), outcome: 'unknown' }; }
@@ -279,44 +385,59 @@ function createTrainingService({ operationStore = null, cache = null, cacheFacto
     return { range, trends, dashboard_html: renderTrainingDashboardHtml({ range, trends }), visual_assets: buildVisualReportAssets({ trends }) };
   }
 
-  async function getTrainingDNAUnlocked({ start_date, end_date, refresh_today = false, refresh_dates = [], refresh_all = false, planned_sessions_per_week, profile } = {}, credentialOverride = null) {
-    let credential;
-    try { credential = credentialOverride || await credentialProvider(); } catch (error) { return { error: toPublicError(error) }; }
+  async function getTrainingDNAUnlocked({ start_date, end_date, refresh_today = false, refresh_dates = [], refresh_all = false, planned_sessions_per_week, profile, persist = true }, credential) {
     const range = await getTrainingRange({ start_date, end_date, refresh_today, refresh_dates, refresh_all, credentialOverride: credential });
     if (range.error) return range;
-    const trends = analyzeTrainingRange({ ...range, planned_sessions_per_week, profile });
     const current = buildReviewFirstTrainingDNA({ range, planned_sessions_per_week, profile, previous_dna: null });
     let persisted = false;
-    let version = 1;
+    let version = null;
+    let savedVersion;
     let previousVersion;
     let changes = { changed_dimensions: [], changes: [] };
-    try {
-      const store = await getDNAStore(credential);
-      const previous = store ? await store.get() : null;
-      const comparable = (value) => JSON.stringify({ data_range: value?.data_range, data_quality: value?.data_quality, metrics: value?.metrics, dimensions: value?.dimensions, unknowns: value?.unknowns, warnings: value?.warnings });
-      const unchanged = Boolean(previous && comparable(previous.training_dna) === comparable(current));
-      if (previous && !unchanged) {
-        version = Number(previous.version || 0) + 1;
-        previousVersion = previous.version;
-        changes = compareTrainingDNA(previous.training_dna, current);
-      }
-      if (store) {
-        const history = Array.isArray(previous?.history) ? previous.history.slice(-11) : [];
-        if (!unchanged) {
-          await store.set({ version, updated_at: now(), training_dna: current, changes, history: [...history, { version, updated_at: now(), data_range: current.data_range, changes }] });
+    if (persist === true) {
+      const prepareUpdate = (previous) => {
+        const comparable = (value) => JSON.stringify({ data_range: value?.data_range, data_quality: value?.data_quality, metrics: value?.metrics, dimensions: value?.dimensions, unknowns: value?.unknowns, warnings: value?.warnings });
+        if (previous) {
+          const stored = Number(previous.version);
+          savedVersion = Number.isSafeInteger(stored) && stored > 0 ? stored : 1;
+          if (comparable(previous.training_dna) === comparable(current)) {
+            version = savedVersion;
+            return undefined;
+          }
+          previousVersion = savedVersion;
+          changes = compareTrainingDNA(previous.training_dna, current);
         }
-        persisted = true;
+        version = (savedVersion || 0) + 1;
+        const updated_at = now();
+        const history = Array.isArray(previous?.history) ? previous.history.slice(-11) : [];
+        return { version, updated_at, training_dna: current, changes,
+          history: [...history, { version, updated_at, data_range: current.data_range, changes }] };
+      };
+      try {
+        const store = await getDNAStore(credential);
+        if (store) {
+          if (store.update) {
+            await store.update(prepareUpdate);
+          } else {
+            const next = prepareUpdate(await store.get());
+            if (next) await store.set(next);
+          }
+          persisted = true;
+        }
+      } catch (_) {
+        current.warnings = [...(current.warnings || []), 'training_dna_persistence_failed'];
       }
-    } catch (error) {
-      current.warnings = [...(current.warnings || []), 'training_dna_persistence_failed'];
     }
-    return { range, training_dna: { ...current, version, ...(previousVersion ? { previous_version: previousVersion } : {}), changes, persisted } };
+    return { range, training_dna: { ...current, version: persisted ? version : null,
+      ...(previousVersion ? { previous_version: previousVersion } : {}),
+      ...(!persisted && savedVersion ? { saved_version: savedVersion } : {}), changes, persisted } };
   }
 
   async function getTrainingDNA(args = {}) {
-    let credential = null;
-    try { credential = await credentialProvider(); } catch (_) { /* getTrainingDNAUnlocked will return the public error */ }
-    const lockKey = credential ? `account:${credentialFingerprint(credential)}` : 'account:unknown';
+    let credential;
+    try { credential = await credentialProvider(); } catch (error) { return { error: toPublicError(error) }; }
+    if (args.persist === false) return getTrainingDNAUnlocked(args, credential);
+    const lockKey = credentialFingerprint(credential);
     const previous = dnaPending.get(lockKey) || Promise.resolve();
     const operation = previous.catch(() => {}).then(() => getTrainingDNAUnlocked(args, credential));
     dnaPending.set(lockKey, operation);
@@ -333,7 +454,7 @@ function createMcpServer(options = {}) {
   const result = async (promise) => {
     const value = await promise;
     return value.error
-      ? { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: value.error }) }] }
+      ? { isError: true, content: [{ type: 'text', text: JSON.stringify(value) }] }
       : { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent: value };
   };
   server.registerTool('xunji_get_training_day', {
@@ -367,10 +488,10 @@ function createMcpServer(options = {}) {
     annotations: { readOnlyHint: true }
   }, ({ start_date, end_date, refresh_today, refresh_dates, refresh_all, planned_sessions_per_week, profile }) => result(service.getTrainingTrends({ start_date, end_date, refresh_today, refresh_dates, refresh_all, planned_sessions_per_week, profile })));
   server.registerTool('xunji_extract_training_dna', {
-    description: 'Extract an evidence-bounded training DNA from cached Xunji records without writing or changing training data.',
-    inputSchema: { start_date: z.string(), end_date: z.string(), refresh_today: z.boolean().optional(), refresh_dates: z.array(z.string()).optional(), refresh_all: z.boolean().optional(), planned_sessions_per_week: z.number().finite().nonnegative().max(14).optional(), profile: z.record(z.string(), z.unknown()).optional() },
-    annotations: { readOnlyHint: true }
-  }, ({ start_date, end_date, refresh_today, refresh_dates, refresh_all, planned_sessions_per_week, profile }) => result(service.getTrainingDNA({ start_date, end_date, refresh_today, refresh_dates, refresh_all, planned_sessions_per_week, profile })));
+    description: 'Extract training DNA without changing Xunji records. Saves local DNA history by default. Set persist to false to skip DNA history; ordinary day-cache reads and refreshes still apply.',
+    inputSchema: { start_date: z.string(), end_date: z.string(), refresh_today: z.boolean().optional(), refresh_dates: z.array(z.string()).optional(), refresh_all: z.boolean().optional(), planned_sessions_per_week: z.number().finite().nonnegative().max(14).optional(), profile: z.record(z.string(), z.unknown()).optional(), persist: z.boolean().optional() },
+    annotations: { readOnlyHint: false }
+  }, (args) => result(service.getTrainingDNA(args)));
   return { server, service };
 }
 

@@ -80,3 +80,50 @@ test('cache rejects a fingerprint that could escape its account namespace', asyn
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('writing a snapshot from an obsolete revision cannot recreate visible stale data', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'xunji-cache-test-'));
+  const date = '2026-08-01';
+  const old = { fetched_at: 1, records: [] };
+  const fresh = { fetched_at: 2, records: [] };
+  try {
+    const writer = new FileCache({ root, fingerprint: VALID_FINGERPRINT });
+    const reader = new FileCache({ root, fingerprint: VALID_FINGERPRINT });
+    const snapshot = await reader.readSnapshot(date);
+    await writer.withWriteRevision(date, async (revision) => {
+      await writer.set(date, fresh, revision);
+      return {};
+    });
+    assert.equal(await reader.saveSnapshot(date, old, snapshot), false);
+    assert.equal(await reader.get(date), null);
+    assert.equal((await reader.readSnapshot(date)).entry.fetched_at, 2);
+    const activeSnapshot = await reader.readSnapshot(date);
+    reader.set = async () => { throw new Error('blocked'); };
+    await assert.rejects(reader.saveSnapshot(date, old, activeSnapshot), /blocked/);
+    assert.throws(() => reader.pathFor(date, '../outside'), { code: 'cache_error' });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed coordination completion leaves the latest epoch readable and reports the degraded state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'xunji-cache-test-'));
+  const date = '2026-08-01';
+  try {
+    const writer = new FileCache({ root, fingerprint: VALID_FINGERPRINT });
+    const transition = writer.revisions.transition.bind(writer.revisions);
+    writer.revisions.transition = async (key, version, value) => {
+      if (value.cache_revision) throw new Error('disk busy');
+      return transition(key, version, value);
+    };
+    const written = await writer.withWriteRevision(date, async (revision) => {
+      await writer.set(date, { fetched_at: 2, records: [] }, revision);
+      return { outcome: 'confirmed' };
+    });
+    assert.deepEqual(written, { outcome: 'confirmed', warnings: ['write_cache_coordination_failed'] });
+    const reopened = new FileCache({ root, fingerprint: VALID_FINGERPRINT });
+    assert.equal((await reopened.readSnapshot(date)).entry.fetched_at, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

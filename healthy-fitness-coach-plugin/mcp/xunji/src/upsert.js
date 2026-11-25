@@ -1,6 +1,7 @@
 'use strict';
 
 const { connectorError } = require('./errors.js');
+const { parseTrainingRecords } = require('./parser.js');
 const { assertDate } = require('./schemas.js');
 
 function normalizeRecordDate(line) {
@@ -36,13 +37,45 @@ function validateUpsertRecords(records) {
   const parsed = records.map(parseUpsertLine);
   const date = parsed[0].date;
   if (parsed.some((record) => record.date !== date)) throw connectorError('mixed_dates');
+  const ids = parsed.flatMap((record) => record.id ? [record.id] : []);
+  if (new Set(ids).size !== ids.length) throw connectorError('invalid_upsert');
   return {
     date,
     records: records.slice(),
     parsed,
-    existing_ids: parsed.filter((record) => record.id).length,
-    new_records: parsed.filter((record) => !record.id).length
+    existing_ids: ids.length,
+    new_records: records.length - ids.length
   };
 }
 
-module.exports = { normalizeRecordDate, parseUpsertLine, validateUpsertRecords };
+const comparableFields = ['title', 'sets', 'reps', 'total_reps', 'weight', 'duration_min', 'distance_km', 'avg_hr'];
+
+function normalizeClock(time) {
+  return time?.replace(/^\d{4}-\d{2}-\d{2}[ T]/, '').replace(/^(\d{2}:\d{2}):00$/, '$1');
+}
+
+function matchesReturnedRecords(validated, returned) {
+  const requested = parseTrainingRecords(validated.records);
+  const match = (source, result) =>
+    comparableFields.every((field) => source[field] === undefined || source[field] === result[field]) &&
+    (source.train_time === undefined || normalizeClock(source.train_time) === normalizeClock(result.train_time));
+  const knownIds = new Set(validated.parsed.flatMap((row) => row.id ? [row.id] : []));
+  const newCandidates = [];
+  for (const [index, source] of requested.entries()) {
+    const id = validated.parsed[index].id;
+    if (id) {
+      if (!returned.some((result) => result.id === id && match(source, result))) return false;
+    } else {
+      if (!source.title) return false;
+      newCandidates.push(returned.filter((result) => result.id && !knownIds.has(result.id) && match(source, result)));
+    }
+  }
+  for (const candidates of newCandidates.sort((a, b) => a.length - b.length)) {
+    const candidate = candidates.find((result) => !knownIds.has(result.id));
+    if (!candidate) return false;
+    knownIds.add(candidate.id);
+  }
+  return true;
+}
+
+module.exports = { matchesReturnedRecords, normalizeRecordDate, parseUpsertLine, validateUpsertRecords };

@@ -1,9 +1,10 @@
 'use strict';
 
-const { inspectSafety } = require('./safety-context.js');
+const { inspectSafety, symptomStatus } = require('./safety-context.js');
 const { normalizeCurrentState } = require('./athlete-state.js');
+const { MINIMUM_SESSION_MINUTES } = require('./program-rules.js');
 
-const PAIN_PATTERN = /(?:pain|discomfort|sore|ache|tight(?:ness)?|stiff(?:ness)?|疼|痛|不适|紧|僵|酸)/iu;
+const PAIN_PATTERN = /(?:chest pain|pain|discomfort|sore|ache|tight(?:ness)?|stiff(?:ness)?|胸(?:口|部)?(?:疼痛|疼|很痛|痛)|疼|痛|不适|紧|僵|酸)/iu;
 const POOR_SLEEP_PATTERN = /(?:poor|bad|insufficient|short|差|不足|不好)/iu;
 const HIGH_FATIGUE_PATTERN = /(?:high|severe|very|heavy|高|严重|很累|疲劳)/iu;
 const SAFE_MARKER_PATTERN = /^(?:none|no(?:\s+(?:pain|flags?))?|false|0|无(?:红旗)?|没有(?:红旗)?|未报告|未提供|unknown|未知)$/iu;
@@ -34,7 +35,7 @@ function hasPain(value) {
   if (!text || SAFE_MARKER_PATTERN.test(text) || NEGATED_PAIN_ONLY_PATTERN.test(text)) return false;
   const numeric = finiteNumber(text);
   if (numeric !== undefined) return numeric > 0;
-  return PAIN_PATTERN.test(text);
+  return symptomStatus(text, PAIN_PATTERN) === 'stop';
 }
 
 function isPoorSleep(value) {
@@ -131,6 +132,22 @@ function assessTodayReadiness(input = {}) {
     && !selectedSession(program, sessionId);
 
   const task = minimumTask(program, sessionId);
+  const minimumMinutes = finiteNumber(selectedSession(program, sessionId)?.minimum_minutes
+    ?? program.minimum_minutes ?? program.session_budget?.minimum_minutes);
+  const usableMinimum = minimumMinutes > 0 ? minimumMinutes : MINIMUM_SESSION_MINUTES;
+  if (availableMinutes >= 0 && (availableMinutes === 0 || availableMinutes < usableMinimum || (timeConstrained && !task && !sessionUnknown))) {
+    facts.push({ code: 'minimum_session_does_not_fit', value: availableMinutes, minimum_minutes: task ? usableMinimum : null });
+    if (painFeedback) facts.push({ code: 'pain_reported', value: pain ?? symptoms });
+    if (isHighFatigue(fatigue)) facts.push({ code: 'high_fatigue_reported', value: fatigue });
+    return commonResult({
+      status: 'defer',
+      facts,
+      reasonCodes: ['minimum_session_does_not_fit'],
+      adjustment: { variable: 'session_selection', primary_variables_changed: 0, direction: 'reschedule_or_select_feasible_session' },
+      minimumTask: null,
+      stopConditions: [{ code: 'reschedule_or_select_feasible_session', text: '可用时间无法执行当前计划。改日安排，或重新确认能在现有时间内安全完成的方案。' }]
+    });
+  }
   if (painFeedback) {
     facts.push({ code: 'pain_reported', value: pain !== undefined ? pain : symptoms });
     if (timeConstrained) facts.push({ code: 'available_time_reduced', value: availableMinutes, planned_value: plannedMinutes });

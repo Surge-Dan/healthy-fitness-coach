@@ -46,7 +46,7 @@ Healthy Fitness Coach不是只服务于“健身房撸铁”。它按训练目�
 我想连接训记。
 ```
 
-Agent先检查连接能力。Windows本地Plugin在受保护入口配置凭据，不要在聊天或截图中提交API Key。手机没有兼容连接器时，导入训记导出文本、文件或截图，先核对日期、单位和组次；也可跳过连接先训练。当前仓库未提供手机远程服务。
+Agent 先检查连接能力。Windows 本地 Plugin 在受保护入口配置凭据，不要在聊天或截图中提交 API Key。仅用手机时，可以手动导入训记文本、文件或截图，先核对日期、单位和组次。自动读取或写回需要 Windows 上的训记 Plugin。
 
 连接成功后可以继续说：
 
@@ -218,7 +218,7 @@ node healthy-fitness-coach/scripts/extract-training-dna.js --input training-rang
 1. **读取**：按日期或日期范围调用训记导出接口，并缓存返回结果，避免同一天重复请求。
 2. **分析**：保留训练ID和训练时间，解析动作、组次、重量、次数和有氧指标。
 3. **预览**：写回前检查日期一致性、记录数量、字符长度和ID是否保留。
-4. **写回**：用户明确确认后，按训练ID调用upsert接口，以服务端返回的`res`作为最终缓存结果。
+4. **写回**：用户确认同一份限时预览后，按训练 ID 提交。连接器验证服务端返回的记录，再更新本地缓存。结果未知时先核对。
 
 写回是按训练ID更新或新建，不会整天覆盖删除；未出现在本次`res`里的历史训练不会被自动删除。
 
@@ -226,9 +226,7 @@ node healthy-fitness-coach/scripts/extract-training-dna.js --input training-rang
 
 ### 独立Skill
 
-适合不需要连接健身App的场景。安装[`healthy-fitness-coach/SKILL.md`](healthy-fitness-coach/SKILL.md)对应的Skill，直接通过对话提供个人情况、训练目标或训练日志即可使用。
-
-可直接分发的Skill包：[`dist/healthy-fitness-coach.skill`](dist/healthy-fitness-coach.skill)
+适合通过对话制定计划、跟练或复盘。请在兼容宿主中安装[完整 Skill 目录](healthy-fitness-coach/)或[下载独立 Skill 包](dist/healthy-fitness-coach.skill)，然后提供个人情况、训练目标或训练日志。
 
 独立模式支持：
 
@@ -250,15 +248,20 @@ codex plugin add healthy-fitness-coach-plugin@surge-dan-fitness
 
 仓库提供 `.agents/plugins/marketplace.json` 作为安装入口。连接器需要本机 Node 运行时及依赖；凭据配置见 Plugin README。安装或升级后新建聊天加载，必要时重启桌面客户端。
 
-如果希望长期在本机自动读取训记，可选安装[`healthy-fitness-coach-plugin/`](healthy-fitness-coach-plugin/)。插件提供本地训记MCP连接器、加密凭据存储、日期范围读取、趋势分析、训练DNA提取与版本保存，以及确认后写回，普通用户不需要使用这条路径。
+需要在 Windows 上自动读取或写回训记时，可[下载 Windows Plugin](dist/healthy-fitness-coach-plugin.zip)，解压后按[安装与凭据配置说明](healthy-fitness-coach-plugin/README.md)完成设置。插件支持日期范围读取、趋势分析、训练 DNA 提取与本机版本保存，以及确认后写回。
 
 ## 手机与换设备
+
+- **手机独立使用**。宿主能加载 Skill 时可指导训练、分析导入记录。当前发行包没有手机独立调用的训记连接器。
+- **手机使用 Windows 上的训记**。在 Windows 的 Codex 安装并配置 [Plugin](healthy-fitness-coach-plugin/README.md)，先在电脑验证一次训记读取。再通过 [Codex Remote](https://learn.chatgpt.com/docs/remote-connections) 连接同一台在线电脑，由电脑执行查询。手机端连线仍待真机验收。
 
 手机默认先给今日任务、最低版本与最少反馈；完整证据按需展开。不能创建文件时返回可复制摘要，不输出HTML源码冒充面板。
 
 说“生成训练接续摘要”或“导入训练摘要继续训练”，保存当前计划版本、最近训练、下次安排与有效期。电脑可保留版本快照和当前指针；另一设备由用户携带摘要导入，没有自动云同步。
 
 写回需要确认匹配的限时预览；超时结果未知先核对，服务端已确认但缓存失败时不重发。历史补录可按日期刷新，最近七天缓存满五分钟更新。
+
+升级前结果仍未知的写回，请先查训记核对原记录再操作。旧版日志只存原批次顺序的摘要，升级后无法从摘要识别已经重排的旧批次。
 
 ## 数据与安全
 
@@ -279,34 +282,30 @@ healthy-fitness-coach-plugin/    # 可选CodexPlugin与训记连接器
 healthy-fitness-coach-plugin/mcp/xunji/src/ # 训记解析、趋势、DNA提取与本地版本存储
 quality-tests/                   # Gherkin、变异、知识库和发布质量门禁
 dist/healthy-fitness-coach.skill # 可直接分发的Skill包
+dist/healthy-fitness-coach-plugin.zip # 带训记连接器的 Windows Plugin
 LICENSE                          # MIT License
 ```
 
 ## 本地开发与验证
 
-维护者可以运行：
+在仓库根目录安装锁定依赖并运行完整质量门禁。
 
 ```powershell
-cd healthy-fitness-coach
-node --test
-
-cd ..\healthy-fitness-coach-plugin\mcp\xunji
-node --test
-
-cd ..\..\..
-node quality-tests\run-gherkin.js
-node quality-tests\run-mutation-smoke.js
-node quality-tests\run-visual-system.js
-node quality-tests\run-visual-png-smoke.js
+npm --prefix healthy-fitness-coach-plugin/mcp/xunji ci --ignore-scripts
+npm --prefix quality-tests ci --ignore-scripts
+python -m pip install Pillow==10.2.0
+npm --prefix quality-tests test
 ```
 
-重新打包独立Skill：
+如修改 Skill 源、视觉脚本或发布内容，先重建，再运行质量门禁。构建会同步 Plugin 副本。
 
 ```powershell
-python -m scripts.package_skill `
-  C:\path\to\healthy-fitness-coach `
-  C:\path\to\dist
+python quality-tests/build-release.py --verify
 ```
+
+检查范围及真机验收记录方式见 [质量门禁](quality-tests/README.md) 和 [移动端验收](docs/mobile-workflow-acceptance.md)。
+
+质量门禁覆盖 Node.js 18 与 24，包括单元与集成测试、可执行 Gherkin、关键变异、生产源码覆盖率、视觉与双包解包验证。维护者可从固定 Git 提交重建历史基线，并按需生成配对评测报告。
 
 照片创作先使用`extract-style.py`和`compile-visual-brief.js`，最终PNG使用`render-visual-composition.py`；旧版报告卡仍可使用`render-share-card.py`。Python图像渲染依赖Pillow，所有个人图片和Manifest都应保存在`fitness-reports/`等本地输出目录，不要提交仓库。
 

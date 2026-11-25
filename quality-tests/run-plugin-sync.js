@@ -11,6 +11,7 @@ const root = path.resolve(__dirname, '..');
 const canonical = path.join(root, 'healthy-fitness-coach');
 const pluginRoot = path.join(root, 'healthy-fitness-coach-plugin');
 const pluginSkill = path.join(pluginRoot, 'skills', 'healthy-fitness-coach');
+const write = process.argv.includes('--write');
 
 function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
@@ -32,6 +33,10 @@ function assertSameFile(sourceRelative, targetRelative = sourceRelative) {
   const source = path.join(canonical, sourceRelative);
   const target = path.join(pluginSkill, targetRelative);
   assert.ok(fs.existsSync(source), `canonical source missing: ${sourceRelative}`);
+  if (write && (!fs.existsSync(target) || sha256(target) !== sha256(source))) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+  }
   assert.ok(fs.existsSync(target), `plugin copy missing: ${targetRelative}`);
   assert.equal(sha256(target), sha256(source), `plugin copy out of sync: ${sourceRelative}`);
 }
@@ -45,6 +50,10 @@ const canonicalSkillFiles = [
   ...listFiles(path.join(canonical, 'references'), 'references')
 ];
 for (const relative of canonicalSkillFiles) assertSameFile(relative);
+for (const folder of ['assets', 'references']) {
+  const actual = listFiles(path.join(pluginSkill, folder), folder);
+  assert.deepEqual(actual, canonicalSkillFiles.filter((file) => file.startsWith(`${folder}/`)));
+}
 
 // Plugin root scripts intentionally rewrite the relative import prefix so they
 // resolve through skills/healthy-fitness-coach/references when copied alone.
@@ -53,6 +62,10 @@ for (const relative of canonicalScripts) {
   const source = fs.readFileSync(path.join(canonical, relative), 'utf8');
   const expected = source.replaceAll('../references/', '../skills/healthy-fitness-coach/references/');
   const target = path.join(pluginRoot, relative);
+  if (write && (!fs.existsSync(target) || fs.readFileSync(target, 'utf8') !== expected)) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, expected, 'utf8');
+  }
   assert.ok(fs.existsSync(target), `plugin CLI script missing: ${relative}`);
   assert.equal(fs.readFileSync(target, 'utf8'), expected, `plugin CLI script out of sync: ${relative}`);
 }

@@ -23,3 +23,13 @@ test('dashboard renderer produces a self-contained escaped HTML trend report', (
   assert.doesNotMatch(html, /<script>alert/);
   assert.doesNotMatch(html, /https?:\/\//i);
 });
+
+test('narrow dashboards constrain grid tracks and wrap long training names', () => {
+  const name = '动作名称'.repeat(32) + 'LongUnbrokenMovementName'.repeat(4);
+  const html = renderTrainingDashboardHtml({ trends: { exercise_frequency: [{ name, count: 1 }] } });
+  assert.ok(html.includes(name));
+  assert.match(html, /minmax\(min\(100%,160px\),1fr\)/);
+  assert.match(html, /table-layout:fixed/);
+  assert.match(html, /overflow-wrap:anywhere/);
+  assert.match(html, /@media\(max-width:480px\)/);
+});

@@ -272,3 +272,63 @@ test('exposes stable field requirements and information-state evaluation', () =>
   assert.equal(evaluateInformationState({ taskType: 'training_review', records: [] }).state, 'ask');
   assert.equal(evaluateInformationState({ taskType: 'today_workout', profile: {} }).state, 'assume');
 });
+
+test('negated, quoted, and capability questions cannot authorize a side-effect route', () => {
+  const cases = [
+    ['不要写回训记，只分析这份训练导出', 'xunji_analysis', 'xunji_writeback'],
+    ['不连接训记，直接帮我制定训练计划', 'training_plan', 'xunji_connect'],
+    ['同事说“写回训记”，请帮我复盘', 'training_review', 'xunji_writeback'],
+    ['怎么连接训记？', 'knowledge_question', 'xunji_connect'],
+    ['可以把记录写回训记吗？', 'knowledge_question', 'xunji_writeback'],
+    ['训记写回功能介绍', 'knowledge_question', 'xunji_writeback'],
+    ['用户问：写回训记', 'knowledge_question', 'xunji_writeback'],
+    ['请问能帮我把记录写回训记吗？', 'xunji_writeback', 'xunji_writeback'],
+    ['不要连接训记，只分析导出', 'xunji_analysis', 'xunji_connect']
+  ];
+  for (const [instruction, task, explicit] of cases) {
+    assert.equal(classifyTrainingTask({ instruction }), task, instruction);
+    assert.equal(classifyTrainingTask({ instruction, taskType: explicit }), task, instruction);
+  }
+  const write = buildWorkflowDecision({ instruction: '先别写回训记，但现在请把已核对的记录写回训记', records: [{}] });
+  assert.equal(write.task_type, 'xunji_writeback');
+  assert.equal(write.writeback.next, 'preview_then_request_explicit_confirmation');
+});
+
+test('Xunji analysis distinguishes exact read, import, credential setup, empty reads and failures', () => {
+  const instruction = '分析训记最近 4 周';
+  const date = '2026-11-24';
+  const configured = { xunji_connector: true, credentials_ready: true };
+  const input = { instruction, reference_date: date, capabilities: configured };
+  const decision = buildWorkflowDecision(input);
+  assert.equal(decision.information_state, 'ready');
+  assert.deepEqual(decision.missing_fields, []);
+  assert.deepEqual(decision.data_source, { status: 'read_pending', action: 'read_range', start_date: '2026-10-28', end_date: date });
+  assert.deepEqual(buildWorkflowDecision({ instruction, now: Date.parse('2026-11-23T16:30:00Z'), capabilities: configured }).data_source, decision.data_source);
+  assert.equal(buildWorkflowDecision({ ...input, instruction: '分析训记' }).data_source.status, 'date_range_needed');
+  for (const [instruction, status] of [
+    ['分析训记 2026-11-24', 'read_pending'],
+    ['分析训记 2026-11-01 到 2026-11-24', 'read_pending'],
+    ['分析训记 2026-11-31', 'date_range_needed'],
+    ['分析训记 2026-11-24 到 2026-11-01', 'date_range_needed'],
+    ['分析训记 2019-01-01 到 2026-11-24', 'date_range_needed'],
+    ['分析今天训记', 'read_pending'],
+    ['分析训记最近 0 天', 'date_range_needed']
+  ]) {
+    assert.equal(buildWorkflowDecision({ ...input, instruction }).data_source.status, status, instruction);
+  }
+  assert.equal(buildWorkflowDecision({ ...input, start_date: '2026-11-01', end_date: date }).data_source.status, 'read_pending');
+  assert.equal(buildWorkflowDecision({ ...input, start_date: date }).data_source.status, 'date_range_needed');
+  assert.equal(buildWorkflowDecision({ instruction }).data_source.status, 'import_needed');
+  assert.equal(buildWorkflowDecision({ ...input, capabilities: { ...configured, credentials_ready: false, protected_credential_input: true } }).data_source.status, 'configure_credentials');
+  assert.equal(buildWorkflowDecision({ ...input, records: [{ date }] }).data_source.status, 'imported');
+  assert.equal(buildWorkflowDecision({ ...input, instruction: '不连接训记，只分析导出' }).data_source.status, 'import_needed');
+  assert.equal(buildWorkflowDecision({
+    ...input, instruction: '不要从训记读取 2025-11-24，只分析我发的训练记录'
+  }).data_source.status, 'import_needed');
+  assert.equal(buildWorkflowDecision({ ...input, connector_result: { records: [], missing_dates: [] } }).data_source.status, 'empty');
+  assert.equal(buildWorkflowDecision({ ...input, connector_result: { records: [], missing_dates: [date] } }).data_source.status, 'read_failed');
+  assert.equal(buildWorkflowDecision({ ...input, connector_result: { days: [{}], records: [], missing_dates: [date] } }).data_source.status, 'partial');
+  assert.equal(buildWorkflowDecision({ ...input, connector_result: { records: [{}], missing_dates: [date] } }).data_source.status, 'partial');
+  assert.equal(buildWorkflowDecision({ ...input, connector_result: { error: 'network' } }).data_source.status, 'read_failed');
+  assert.equal(buildWorkflowDecision({ ...input, capabilities: { ...configured, protected_credential_input: true }, connector_result: { error: { code: 'invalid_credentials' } } }).data_source.status, 'configure_credentials');
+});

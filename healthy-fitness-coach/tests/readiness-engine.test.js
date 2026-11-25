@@ -6,6 +6,7 @@ const test = require('node:test');
 const { assessTodayReadiness } = require('../references/readiness-engine.js');
 const { normalizeCurrentState } = require('../references/athlete-state.js');
 const { buildTodayReadinessGuidance } = require('../references/training-guidance.js');
+const { buildWorkflowDecision } = require('../references/training-orchestrator.js');
 
 const program = {
   status: 'ready',
@@ -315,4 +316,76 @@ test('today guidance adapts a top-level symptoms alias into the readiness curren
   assert.equal(result.status, 'regress');
   assert.ok(result.reason_codes.includes('pain_feedback'));
   assert.ok(result.stop_conditions.some((item) => item.code === 'reassess_pain_in_24_to_48_hours'));
+});
+
+test('documented current red flags override plan, report, handoff and share requests', () => {
+  for (const symptoms of [
+    '胸痛', '胸部压迫感', '明显气短', '呼吸困难', '晕厥', '接近晕厥', '原因不明的明显头晕',
+    '异常心悸伴不适', '进行性麻木', '进行性无力', '大小便功能异常', '明显畸形', '无法负重',
+    '严重肿胀', '疑似急性严重外伤', '症状快速恶化', '情况紧急', '近期手术', '妊娠', '产后'
+  ]) {
+    for (const request of ['帮我制定训练计划', '直接出报告', '导出训练接续摘要', '生成分享图']) {
+      const input = { instruction: `今天我出现${symptoms}，${request}`, capabilities: { can_write_files: true, mobile: true } };
+      const decision = buildWorkflowDecision(input);
+      assert.equal(decision.safety.status, 'stop', input.instruction);
+      assert.deepEqual(decision.artifacts, [], input.instruction);
+      assert.equal(assessTodayReadiness(input).status, 'stop', input.instruction);
+    }
+  }
+});
+
+test('red-flag scope handles lists, contrast, history, uncertainty and structured answers', () => {
+  const cases = [
+    [{ instruction: '我没有胸痛或呼吸困难，今天练什么？' }, 'clear'],
+    [{ currentState: { symptoms: '没有胸痛、异常气短或晕厥' } }, 'clear'],
+    [{ currentState: { red_flags: { chest_pain: false, dizziness: false } } }, 'clear'],
+    [{ currentState: { red_flags: { chest_pain: false, dyspnea: true } } }, 'stop'],
+    [{ currentState: normalizeCurrentState({ red_flags: { chest_pain: false, dyspnea: true } }) }, 'stop'],
+    [{ currentState: normalizeCurrentState({ safety: { symptoms: '明显气短' } }) }, 'stop'],
+    [{ currentState: normalizeCurrentState({ red_flags: [{ code: 'chest_pain', present: false }] }) }, 'clear'],
+    [{ instruction: '没有胸痛、异常气短，但现在感觉要晕倒' }, 'stop'],
+    [{ instruction: '没有胸痛，呼吸困难持续加重' }, 'stop'],
+    [{ instruction: '没有胸痛，明显气短了' }, 'stop'],
+    [{ instruction: '没有胸痛，呼吸困难' }, 'clarify'],
+    [{ instruction: '我现在突然喘不过气，今天练什么？' }, 'stop'],
+    [{ profile: { red_flags: ['chest_pain'] } }, 'stop'],
+    [{ current_state: { safety: { red_flags: false, redFlags: ['chest_pain'] } } }, 'stop'],
+    [{ instruction: '并非没有胸痛' }, 'stop'],
+    [{ instruction: 'I have no chest pain, dizziness, or shortness of breath.' }, 'clear'],
+    [{ instruction: '去年有胸痛，今天练什么？' }, 'clarify'],
+    [{ instruction: '去年有胸痛，今天又出现明显气短' }, 'stop'],
+    [{ instruction: '我不确定是不是呼吸困难，帮我生成分享卡' }, 'clarify'],
+    [{ instruction: '我现在可能有胸痛，还有明显气短' }, 'stop'],
+    [{ instruction: '什么是明显气短？' }, 'clear'],
+    [{ instruction: '什么是胸痛？我胸口现在很痛' }, 'stop'],
+    [{ instruction: 'I have no chest pain or shortness of breath.' }, 'clear'],
+    [{ instruction: 'I had chest pain last year, can I train today?' }, 'clarify'],
+    [{ instruction: 'I have chest pain now similar to last year.' }, 'stop'],
+    [{ currentState: { safety: { symptoms: { description: '今天胸部压迫感' } } } }, 'stop']
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(buildWorkflowDecision(input).safety.status, expected, JSON.stringify(input));
+    assert.equal(assessTodayReadiness(input).status, expected === 'clear' ? 'proceed' : 'stop', JSON.stringify(input));
+  }
+});
+
+test('insufficient time removes executable tasks even with fatigue, discomfort or no plan', () => {
+  const timedProgram = { ...program, session_slots: [{ ...program.session_slots[0], minimum_minutes: 12 }] };
+  for (const [available_time_min, currentState, currentProgram] of [
+    [0, { fatigue: 'high' }, timedProgram],
+    [5, { pain: 'shoulder discomfort' }, timedProgram],
+    [0, {}, {}],
+    [5, {}, program],
+    [11, {}, timedProgram]
+  ]) {
+    const result = assessTodayReadiness({ currentState: { ...currentState, available_time_min }, program: currentProgram });
+    assert.equal(result.status, 'defer');
+    assert.equal(result.minimum_task, null);
+    assert.equal(result.adjustment.direction, 'reschedule_or_select_feasible_session');
+  }
+  for (const available_time_min of [12, 20]) {
+    const result = assessTodayReadiness({ currentState: { available_time_min }, program: timedProgram });
+    assert.equal(result.status, 'regress');
+    assert.ok(result.minimum_task);
+  }
 });

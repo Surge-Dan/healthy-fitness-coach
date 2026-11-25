@@ -7,6 +7,7 @@ const path = require('node:path');
 const { buildWorkflowDecision, classifyTrainingTask } = require('../references/training-orchestrator.js');
 const { assessTodayReadiness } = require('../references/readiness-engine.js');
 const { createCheckpoint, assessResume, saveCheckpoint } = require('../references/training-continuity.js');
+const { createHash } = require('node:crypto');
 test('phone without connector offers import without credentials or records prerequisite', () => {
   const result = buildWorkflowDecision({ instruction: '我想连接训记', capabilities: { mobile: true, can_write_files: false } });
   assert.equal(result.task_type, 'xunji_connect'); assert.equal(result.information_state, 'ready');
@@ -55,4 +56,59 @@ test('portable checkpoint excludes credential fields and distinguishes stale/con
     saveCheckpoint(dir,next,{consent:true}); assert.ok(fs.existsSync(saved.snapshot_path));
     assert.equal(JSON.parse(fs.readFileSync(saved.current_pointer)).checkpoint_id,next.checkpoint_id);
   } finally {fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('only boolean true confirms the new session state', () => {
+  const snapshot = createCheckpoint({ updated_at: '2026-11-24', valid_until: '2026-11-25' });
+  const now = Date.parse('2026-11-24T12:00:00+08:00');
+  for (const state_confirmed of [undefined, null, false, 'false', 'true', 1, {}, []]) {
+    assert.equal(assessResume(snapshot, { now, state_confirmed }).status, 'confirm_current_state');
+  }
+  assert.equal(assessResume(snapshot, { now, state_confirmed: true }).status, 'ready');
+});
+
+test('canonical checkpoint survives reordering and expires at the end of its calendar day', () => {
+  const snapshot = createCheckpoint({ updated_at: '2026-11-24', valid_until: '2026-11-24', timezone: 'Asia/Shanghai' });
+  const reordered = Object.fromEntries(Object.entries(snapshot).reverse());
+  const program = Object.fromEntries(Object.entries(snapshot.program).reverse());
+  assert.equal(assessResume({ ...reordered, program }, { now: Date.parse('2026-11-24T23:59:59.999+08:00') }).status, 'confirm_current_state');
+  assert.equal(assessResume(snapshot, { now: Date.parse('2026-11-25T00:00:00+08:00') }).status, 'stale');
+  assert.equal(assessResume({ ...snapshot, next_session: 'changed' }).status, 'invalid');
+});
+
+test('old checkpoints still validate and exact timestamp expiry retains its original instant', () => {
+  const legacy = { schema_version: '1.0', updated_at: '2026-11-24', valid_until: '2026-11-24T10:00:00-05:00', next_session: 'old plan' };
+  legacy.checkpoint_id = createHash('sha256').update(JSON.stringify(legacy)).digest('hex');
+  assert.equal(assessResume(legacy, { now: Date.parse('2026-11-24T15:00:00Z') }).status, 'confirm_current_state');
+  assert.equal(assessResume(legacy, { now: Date.parse('2026-11-24T15:00:00.001Z') }).status, 'stale');
+});
+
+test('a matching checksum does not make an incomplete current-format checkpoint usable', () => {
+  const data = { schema_version: '1.1', timezone: 'Asia/Shanghai', updated_at: '2026-11-24', valid_until: '2026-12-01' };
+  const sorted = Object.fromEntries(Object.entries(data).sort(([a], [b]) => a.localeCompare(b)));
+  const checkpoint_id = createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+  assert.equal(assessResume({ ...data, checkpoint_id }, {
+    now: Date.parse('2026-11-25T00:00:00Z'), state_confirmed: true
+  }).status, 'invalid');
+});
+
+test('explicit supported attachments still work on mobile; handoff has a copyable fallback', () => {
+  const cases = [
+    ['分析训记，生成趋势面板', 'training-dashboard.html'],
+    ['请生成训练分享图', 'SHARE_CARD.png'],
+    ['导出训练接续摘要', 'TRAINING_CHECKPOINT.json']
+  ];
+  for (const [instruction, filename] of cases) {
+    const mobile = buildWorkflowDecision({ instruction, capabilities: { mobile: true, can_write_files: true } });
+    assert.ok(mobile.artifacts.includes(filename), instruction);
+    for (const can_write_files of [false, undefined]) {
+      const portable = buildWorkflowDecision({ instruction, capabilities: { mobile: true, can_write_files } });
+      assert.equal(portable.interaction_mode, 'conversation');
+      assert.deepEqual(portable.artifacts, []);
+      assert.deepEqual(buildWorkflowDecision({ instruction, capabilities: { mobile: false, can_write_files } }).artifacts, []);
+    }
+  }
+  const desktop = buildWorkflowDecision({ instruction: '导出训练接续摘要', capabilities: { can_write_files: true } });
+  assert.deepEqual(desktop.artifacts, ['TRAINING_CHECKPOINT.json', 'TRAINING_HANDOFF.md']);
+  assert.deepEqual(buildWorkflowDecision({ instruction: '导出训练接续摘要' }).artifacts, []);
 });

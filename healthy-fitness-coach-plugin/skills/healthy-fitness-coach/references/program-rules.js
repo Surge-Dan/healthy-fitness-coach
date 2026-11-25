@@ -1,8 +1,9 @@
 'use strict';
 
 const { normalizeAthleteProfile } = require('./athlete-state.js');
+const { inspectSafety } = require('./safety-context.js');
 
-const DANGER_PATTERN = /(?:chest\s*pain|shortness\s+of\s+breath|faint(?:ing)?|severe\s+pain|acute\s+(?:injury|trauma)|胸痛|呼吸困难|晕厥|剧烈疼痛|急性(?:外伤|损伤))/iu;
+const MINIMUM_SESSION_MINUTES = 15;
 const UNSAFE_METHOD_PATTERNS = [
   ['crash_diet', /(?:crash\s+diet|extreme\s+diet|starvation|极端节食|不吃|禁食)/iu]
 ];
@@ -59,7 +60,7 @@ function selectProgramStructure(profile = {}) {
 function buildSessionBudget({ durationMinutes, experience } = {}) {
   const novice = normalizedExperience(experience) === 'beginner';
   const knownDuration = typeof durationMinutes === 'number' && Number.isFinite(durationMinutes) && durationMinutes > 0;
-  const feasible = knownDuration && durationMinutes >= 15;
+  const feasible = knownDuration && durationMinutes >= MINIMUM_SESSION_MINUTES;
   const plannedMinutes = knownDuration ? Math.floor(durationMinutes) : null;
   const movementSlots = feasible
     ? Math.min(novice ? 3 : 4, durationMinutes <= 30 ? 2 : (durationMinutes <= 45 ? 3 : 4))
@@ -73,6 +74,7 @@ function buildSessionBudget({ durationMinutes, experience } = {}) {
   return {
     declared_minutes: knownDuration ? Math.floor(durationMinutes) : null,
     planned_minutes: plannedMinutes,
+    minimum_minutes: feasible ? MINIMUM_SESSION_MINUTES : null,
     movement_slots: feasible ? movementSlots : 0,
     sets_per_slot: feasible ? { min: 1, max: maxSetsPerSlot } : { min: 0, max: 0 },
     total_work_sets_max: feasible ? movementSlots * maxSetsPerSlot : 0,
@@ -167,24 +169,16 @@ function parseTimeWindow(text) {
 }
 
 function classifySafetyRisk(input = {}) {
-  const redFlagValues = [
-    input.red_flags,
-    input.redFlags,
-    input.safety && input.safety.red_flags,
-    input.safety && input.safety.redFlags,
-    input.currentState && input.currentState.red_flags,
-    input.currentState && input.currentState.redFlags,
-    input.current_state && input.current_state.red_flags,
-    input.current_state && input.current_state.redFlags
-  ].flatMap((value) => Array.isArray(value) ? value : [value]);
-  const text = `${inputSafetyText(input)} ${redFlagValues.filter(Boolean).join(' ')}`;
+  const text = inputSafetyText(input);
   const target_change = parseTargetChange(text);
   const time_window = parseTimeWindow(text);
   const unsafe_methods = UNSAFE_METHOD_PATTERNS
     .filter(([, pattern]) => pattern.test(text))
     .map(([code]) => code);
   const reason_codes = [];
-  if (redFlagValues.some((value) => value === true || (typeof value === 'string' && value.trim() !== '') || (value && typeof value === 'object')) || DANGER_PATTERN.test(text)) {
+  const safety = inspectSafety(input);
+  const constraints = inspectSafety({ symptoms: [input.goal, input.injury_or_medical_constraints] });
+  if (safety.status !== 'clear' || constraints.status !== 'clear') {
     reason_codes.push('danger_flag');
   }
   if (target_change && time_window && target_change.amount_kg / time_window.days >= EXTREME_CHANGE_RATE_KG_PER_DAY) reason_codes.push('extreme_change_rate');
@@ -301,6 +295,7 @@ function compileProgramRules(input = {}) {
 }
 
 module.exports = {
+  MINIMUM_SESSION_MINUTES,
   selectProgramStructure,
   buildSessionBudget,
   defaultIntensityRules,

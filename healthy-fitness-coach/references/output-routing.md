@@ -35,6 +35,7 @@
 | `training_review` | `markdown` | `WEEKLY_REVIEW.md`、`DECISION_LOG.md`；索引为 `TRAINING_REVIEW_INDEX.md` |
 | `training_system` | `markdown` | 四个核心资产：`ATHLETE_PROFILE.md`、`TRAINING_DNA.md`、`CURRENT_PROGRAM.md`、`DECISION_LOG.md`；索引为 `TRAINING_SYSTEM_INDEX.md` |
 | `xunji_analysis` | `markdown` | `TRAINING_ANALYSIS.md`；显式趋势面板时追加 `training-dashboard.html` 并使用 `XUNJI_ANALYSIS_INDEX.md` |
+| `training_handoff` | 可写时 `markdown` | `TRAINING_CHECKPOINT.json`、`TRAINING_HANDOFF.md`，索引为 `TRAINING_HANDOFF_INDEX.md` |
 | `share_output` | `conversation` | `SHARE_CARD.png`、`SHARE_FACTS.md`；索引为 `SHARE_OUTPUT_INDEX.md` |
 
 任一计划最终包含两个或以上资产时，`index` 必定存在且其路径位于 `paths` 首位。索引可复用 `assets/training-system-index-template.md` 的内容结构；模板只提供保存时的内容骨架，不代表系统已自动持久化健康数据。
@@ -51,4 +52,4 @@ Markdown 模式且具备写入工具时，默认在 `fitness-reports/` 创建完
 
 ## 手机与接续覆盖
 
-`capabilities.mobile: true` 或 `can_write_files: false` 优先返回 conversation 与可复制摘要，不倾倒 HTML。桌面资产计划保留。连接、写回、恢复分别为 `xunji_connect`、`xunji_writeback`、`resume_training`，使用对话。按 `references/mobile-continuity.md` 保存接续快照和当前指针，旧版本保留。
+手机默认用对话给摘要，并在 `can_write_files: true` 且用户明确请求时交付趋势面板、分享图、接续摘要等附件。已传能力对象但文件能力未知或只读时，给可复制摘要。旧调用端省略能力对象时仍可预览桌面资产计划，执行前须实际确认写入能力。连接、写回和恢复优先用对话。接续导出与长期快照的流程见 `references/mobile-continuity.md`。

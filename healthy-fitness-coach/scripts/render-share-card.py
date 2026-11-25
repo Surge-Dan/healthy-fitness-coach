@@ -511,7 +511,9 @@ def main():
     width_scale = width / 2048
     fonts = (
         font(max(22, int(width * 0.014)), bold=False),
-        font(max(54, int(width * 0.053)), bold=True, serif=(layout == "rich")),
+        # Rich infographic titles should use the CJK sans fallback on Windows.
+        # SimSun bold is not consistently available and can render Chinese as tofu.
+        font(max(54, int(width * 0.053)), bold=True, serif=False),
         font(max(24, int(width * 0.018)), bold=False, serif=(layout == "rich")),
         font(max(34, int(width * 0.029)), bold=True),
     )

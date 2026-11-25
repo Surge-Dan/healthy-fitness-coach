@@ -119,3 +119,12 @@ test('returns predictable suffixed paths without overwriting existing files', ()
   assert.deepEqual(plan.paths, [join(outputDirectory, 'TODAY_WORKOUT-3.md')]);
   rmSync(root, { recursive: true, force: true });
 });
+test('direct output planning suppresses attachments on a current safety report', () => {
+  const plan = planOutputAssets({
+    taskType: 'share_output',
+    userInstruction: '我今天明显气短，生成分享图',
+    capabilities: { can_write_files: true }
+  });
+  assert.equal(plan.reason, 'safety_override');
+  assert.deepEqual(plan.artifacts, []);
+});

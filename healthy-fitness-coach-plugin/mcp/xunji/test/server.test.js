@@ -482,6 +482,60 @@ test('service persists versioned training DNA and returns an auditable diff', as
   assert.ok(Array.isArray(second.training_dna.changes.changed_dimensions));
 });
 
+test('concurrent identical analyses keep the latest saved DNA version', async () => {
+  let artifact = null;
+  let saves = 0;
+  const service = createTrainingService({
+    cache: memoryCache(),
+    dnaStore: { async get() { return artifact; }, async set(value) { saves += 1; artifact = value; } },
+    credentialProvider: async () => 'SYNTHETIC_ACCOUNT_A',
+    client: { async fetchDay(date) { return { records: [`${date},id:${date},卧推,1组,60kg,8次`] }; } }
+  });
+  const first = await service.getTrainingDNA({ start_date: '2026-08-01', end_date: '2026-08-01' });
+  const changed = { start_date: '2026-08-01', end_date: '2026-08-02' };
+  const [second, repeated] = await Promise.all([service.getTrainingDNA(changed), service.getTrainingDNA(changed)]);
+  assert.deepEqual([first, second, repeated].map((result) => result.training_dna.version), [1, 2, 2]);
+  assert.equal(repeated.training_dna.persisted, true);
+  assert.equal(saves, 2);
+  assert.deepEqual(artifact.history.map((entry) => entry.version), [1, 2]);
+});
+
+test('explicit DNA analysis-only request skips the DNA store and default still persists', async () => {
+  let gets = 0;
+  let saves = 0;
+  const service = createTrainingService({
+    cache: memoryCache(),
+    dnaStore: { async get() { gets += 1; return null; }, async set() { saves += 1; } },
+    credentialProvider: async () => 'SYNTHETIC_ACCOUNT_A',
+    client: { async fetchDay() { return { records: [] }; } }
+  });
+  const range = { start_date: '2026-08-01', end_date: '2026-08-01' };
+  const provisional = await service.getTrainingDNA({ ...range, persist: false });
+  assert.equal(provisional.training_dna.persisted, false);
+  assert.equal(provisional.training_dna.version, null);
+  assert.equal(gets, 0);
+  assert.equal(saves, 0);
+  assert.equal((await service.getTrainingDNA({ ...range, profile: { persisted: false } })).training_dna.persisted, true);
+  assert.equal(saves, 1);
+});
+
+test('failed DNA save reports the older saved version and leaves the new result unversioned', async () => {
+  let artifact;
+  const service = createTrainingService({
+    cache: memoryCache(),
+    dnaStore: { async get() { return artifact; }, async set(value) { if (artifact) throw new Error('disk'); artifact = value; } },
+    credentialProvider: async () => 'SYNTHETIC_ACCOUNT_A',
+    client: { async fetchDay() { return { records: [] }; } }
+  });
+  await service.getTrainingDNA({ start_date: '2026-08-01', end_date: '2026-08-01' });
+  const calculated = await service.getTrainingDNA({ start_date: '2026-08-01', end_date: '2026-08-02' });
+  assert.equal(calculated.training_dna.persisted, false);
+  assert.equal(calculated.training_dna.version, null);
+  assert.equal(calculated.training_dna.saved_version, 1);
+  assert.ok(calculated.training_dna.warnings.includes('training_dna_persistence_failed'));
+  assert.equal(artifact.version, 1);
+});
+
 async function submitPreviewed(service, args) {
   if (!args.confirm) return service.upsertTrainingRecords(args);
   const preview = await service.previewTrainingUpsert({ records: args.records });

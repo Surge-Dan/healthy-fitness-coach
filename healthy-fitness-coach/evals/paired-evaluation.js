@@ -3,10 +3,9 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { BASELINE_COMMIT, withBaseline } = require('./baseline.js');
 
-const BASELINE_COMMIT = '180549f30a7579d5f4c2733ee662f64229531e78';
 const CASE_IDS = [13, 14, 15, 16, 17, 18];
-const SNAPSHOT_RELATIVE = path.join('healthy-fitness-coach-workspace', 'training-os-redesign', 'skill-snapshot');
 const CURRENT_RELATIVE = 'healthy-fitness-coach';
 
 function readJson(filePath) {
@@ -26,11 +25,11 @@ function hasAll(text, fragments) {
   return Boolean(text) && fragments.every((fragment) => text.includes(fragment));
 }
 
-function evidence(root, relativePath, fragments) {
+function evidence(root, relativePath, fragments, pathPrefix = '') {
   const absolutePath = path.join(root, relativePath);
   const text = readText(root, relativePath);
   return {
-    path: relativePath.replaceAll(path.sep, '/'),
+    path: pathPrefix + relativePath.replaceAll(path.sep, '/'),
     present: Boolean(text),
     sha256: text ? sha256(absolutePath) : null,
     required_fragments: fragments,
@@ -70,15 +69,13 @@ function currentEvals(root) {
   return readJson(path.join(root, CURRENT_RELATIVE, 'evals', 'evals.json')).evals.filter((item) => CASE_IDS.includes(item.id));
 }
 
-function baselineEvals(root) {
-  return readJson(path.join(root, SNAPSHOT_RELATIVE, 'evals', 'evals.json')).evals;
-}
-
-function buildCaseAssertions(root, evalCase, baselineIds) {
+function buildCaseAssertions(root, evalCase, baselineIds, baselineDirectory) {
   const currentBase = CURRENT_RELATIVE;
-  const oldBase = SNAPSHOT_RELATIVE;
+  const oldEvidence = (parts, fragments) => evidence(
+    baselineDirectory, path.join(...parts), fragments, CURRENT_RELATIVE + '/'
+  );
   const orchestration = evidence(root, path.join(currentBase, 'references', 'training-orchestration.md'), []);
-  const oldOrchestration = evidence(root, path.join(oldBase, 'references', 'training-orchestration.md'), []);
+  const oldOrchestration = oldEvidence(['references', 'training-orchestration.md'], []);
   const assertions = [assertion({
     id: 'eval_definition_is_new',
     description: '当前评测定义包含该成对场景；旧快照只保留评测 1–12。',
@@ -112,9 +109,9 @@ function buildCaseAssertions(root, evalCase, baselineIds) {
         program_template: evidence(root, path.join(currentBase, 'assets', 'current-program-template.md'), [])
       },
       baseline: {
-        assessment: evidence(root, path.join(oldBase, 'references', 'assessment.md'), ['已提供且仍适用的稳定字段不重复追问']),
-        profile_template: evidence(root, path.join(oldBase, 'assets', 'athlete-profile-template.md'), []),
-        program_template: evidence(root, path.join(oldBase, 'assets', 'current-program-template.md'), [])
+        assessment: oldEvidence(['references', 'assessment.md'], ['已提供且仍适用的稳定字段不重复追问']),
+        profile_template: oldEvidence(['assets', 'athlete-profile-template.md'], []),
+        program_template: oldEvidence(['assets', 'current-program-template.md'], [])
       }
     }));
   }
@@ -127,8 +124,8 @@ function buildCaseAssertions(root, evalCase, baselineIds) {
         readiness: evidence(root, path.join(currentBase, 'references', 'readiness-engine.js'), [])
       },
       baseline: {
-        assessment: evidence(root, path.join(oldBase, 'references', 'assessment.md'), ['稳定画像', '当前状态', '不重复追问']),
-        readiness: evidence(root, path.join(oldBase, 'references', 'readiness-engine.js'), [])
+        assessment: oldEvidence(['references', 'assessment.md'], ['稳定画像', '当前状态', '不重复追问']),
+        readiness: oldEvidence(['references', 'readiness-engine.js'], [])
       }
     }));
   }
@@ -137,13 +134,13 @@ function buildCaseAssertions(root, evalCase, baselineIds) {
       id: 'review_decision_contract',
       description: '新版复盘引擎显式输出事实、推断、不确定性、验证和至多两个调整；旧快照缺少该引擎。',
       current: evidence(root, path.join(currentBase, 'references', 'review-decision-engine.js'), ['facts:', 'inference:', 'uncertainty:', 'validation:', 'changes.length >= 2']),
-      baseline: evidence(root, path.join(oldBase, 'references', 'review-decision-engine.js'), [])
+      baseline: oldEvidence(['references', 'review-decision-engine.js'], [])
     }));
   }
   if (evalCase.id === 18) {
     const sample = [{ date: '2026-08-01', exercise: 'squat', weight: 40, reps: 8, source_record_id: 'single-record' }];
     const currentDna = require(path.join(root, currentBase, 'references', 'training-dna-engine.js')).extractTrainingDNA({ records: sample, generatedAt: '2000-01-01T00:00:00.000Z' });
-    const baselineDna = require(path.join(root, oldBase, 'references', 'training-dna-engine.js')).extractTrainingDNA({ records: sample, generatedAt: '2000-01-01T00:00:00.000Z' });
+    const baselineDna = require(path.join(baselineDirectory, 'references', 'training-dna-engine.js')).extractTrainingDNA({ records: sample, generatedAt: '2000-01-01T00:00:00.000Z' });
     assertions.push(assertion({
       id: 'single_record_dna_boundary',
       description: '同一条合成训练记录在两版的阻力反应均为低置信度，并保留未知维度；这是静态正确性对照，不代表自然语言输出优劣。',
@@ -154,12 +151,13 @@ function buildCaseAssertions(root, evalCase, baselineIds) {
   return assertions;
 }
 
-function buildPairedEvaluation({ root = path.resolve(__dirname, '..', '..') } = {}) {
+function buildPairedEvaluation({ root = path.resolve(__dirname, '..', '..'), baselineDirectory } = {}) {
+  if (!baselineDirectory) return withBaseline(root, (directory) => buildPairedEvaluation({ root, baselineDirectory: directory }));
   const evals = currentEvals(root);
   if (evals.length !== CASE_IDS.length || evals.some((item, index) => item.id !== CASE_IDS[index])) {
     throw new Error('当前评测必须精确包含连续的 ID 13–18。');
   }
-  const baselineIds = new Set(baselineEvals(root).map((item) => item.id));
+  const baselineIds = new Set(readJson(path.join(baselineDirectory, 'evals', 'evals.json')).evals.map((item) => item.id));
   return {
     schema_version: '1.0',
     comparison_kind: 'static_source_contract',
@@ -168,7 +166,7 @@ function buildPairedEvaluation({ root = path.resolve(__dirname, '..', '..') } = 
       '静态断言只能证明源码、模板与确定性函数的能力边界，不能证明自然语言回答质量。',
       'Token 和完成时间必须由人工在同一模型、同一设置、隔离会话中记录。'
     ],
-    baseline: { source_commit: BASELINE_COMMIT, snapshot_path: SNAPSHOT_RELATIVE.replaceAll(path.sep, '/') },
+    baseline: { source_commit: BASELINE_COMMIT, skill_path: CURRENT_RELATIVE, source: 'git' },
     current: { skill_path: CURRENT_RELATIVE },
     cases: evals.map((evalCase) => ({
       eval_id: evalCase.id,
@@ -176,7 +174,7 @@ function buildPairedEvaluation({ root = path.resolve(__dirname, '..', '..') } = 
       expected_output: evalCase.expected_output,
       requires_follow_up: evalCase.requires_follow_up,
       model_outputs_recorded: false,
-      static_assertions: buildCaseAssertions(root, evalCase, baselineIds),
+      static_assertions: buildCaseAssertions(root, evalCase, baselineIds, baselineDirectory),
       manual_review: manualReview(evalCase.id)
     }))
   };
@@ -202,19 +200,39 @@ function renderReviewPage(result) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>训练操作系统成对静态审查</title><style>body{font:16px/1.55 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 20px;color:#172033;background:#f7f8fa}article,details{background:#fff;border:1px solid #d9dee7;border-radius:10px;padding:16px;margin:16px 0}h1,h2,h3,h4{margin-top:0}.note{background:#fff4d6;padding:14px;border-left:4px solid #d89b00}.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}pre,textarea{box-sizing:border-box;width:100%;white-space:pre-wrap;word-break:break-word;background:#101827;color:#d7e2f0;border-radius:6px;padding:12px}textarea{min-height:96px;margin:6px 0 14px;background:#fff;color:#172033;border:1px solid #aeb8c6}@media(max-width:720px){.grid{grid-template-columns:1fr}}</style></head><body><h1>训练操作系统：评测 13–18 成对静态审查</h1><p>基线提交：<code>${BASELINE_COMMIT}</code>。当前页只展示可复现的源码与结构断言。</p><div class="note"><strong>限制：</strong>未记录模型输出，也未运行模型；页面中的文本框仅供本地人工粘贴，不保存任何内容。Token、完成时间与对话质量均为人工审查项。</div><h2>总则</h2><ul>${result.limitations.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>${caseSections}</body></html>`;
 }
 
-function writePairedEvaluationArtifacts({ root = path.resolve(__dirname, '..', '..') } = {}) {
-  const result = buildPairedEvaluation({ root });
-  const outputDirectory = path.join(root, CURRENT_RELATIVE, 'evals');
+function writePairedEvaluationArtifacts({
+  root = path.resolve(__dirname, '..', '..'),
+  outputDirectory = path.join(root, 'output', 'paired-evaluation'),
+  baselineDirectory,
+  check = false
+} = {}) {
+  const result = buildPairedEvaluation({ root, baselineDirectory });
+  if (!check) fs.mkdirSync(outputDirectory, { recursive: true });
   const results_path = path.join(outputDirectory, 'paired-evaluation-results.json');
   const review_page_path = path.join(outputDirectory, 'paired-evaluation-review.html');
-  fs.writeFileSync(results_path, `${JSON.stringify(result, null, 2)}\n`, 'utf8');
-  fs.writeFileSync(review_page_path, renderReviewPage(result), 'utf8');
+  const artifacts = [[results_path, `${JSON.stringify(result, null, 2)}\n`], [review_page_path, renderReviewPage(result)]];
+  for (const [destination, content] of artifacts) {
+    if (check) {
+      if (fs.readFileSync(destination, 'utf8') !== content) {
+        throw new Error(`Stale paired evaluation: ${path.basename(destination)}`);
+      }
+    } else {
+      fs.writeFileSync(destination, content, 'utf8');
+    }
+  }
   return { results_path, review_page_path };
 }
 
 if (require.main === module) {
-  const output = writePairedEvaluationArtifacts();
-  process.stdout.write(`PASS paired static evaluation: ${path.basename(output.results_path)} and ${path.basename(output.review_page_path)}\n`);
+  if (process.argv.includes('--check')) {
+    const failures = buildPairedEvaluation().cases.flatMap(({ static_assertions }) => static_assertions)
+      .filter(({ status }) => status !== 'pass');
+    if (failures.length) throw new Error('Static evaluation failed: ' + failures.map(({ id }) => id).join(', '));
+    process.stdout.write('PASS paired static evaluation: all contracts verified from the pinned Git baseline\n');
+  } else {
+    const output = writePairedEvaluationArtifacts();
+    process.stdout.write('PASS paired static evaluation: ' + output.results_path + ' and ' + output.review_page_path + '\n');
+  }
 }
 
 module.exports = { buildPairedEvaluation, renderReviewPage, writePairedEvaluationArtifacts };

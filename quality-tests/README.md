@@ -1,47 +1,39 @@
 # 质量门禁
 
-这组检查把Skill、训记连接器和视觉导出放在同一条发布门禁中，避免只验证单个函数。
-
-## 必跑检查
+在仓库根目录运行。CI 在 Windows 上验证 Node.js 18.19.0 和 24.22.1。Python 3.9 需安装 Pillow 10.2.0。
 
 ```powershell
-# 独立Skill单元/集成/视觉回归
-cd healthy-fitness-coach
-node --test
-node --experimental-test-coverage --test
-
-# 训记MCP连接器
-cd ..\healthy-fitness-coach-plugin\mcp\xunji
-node --test
-node --experimental-test-coverage --test
-
-# Gherkin验收场景与轻量变异测试
-cd ..\..\..
-node quality-tests\run-gherkin.js
-node quality-tests\run-mutation-smoke.js
-node quality-tests\run-knowledge-base.js
-node quality-tests\run-training-system.js
-node quality-tests\run-visual-system.js
-node quality-tests\run-visual-png-smoke.js
-
-# Skill格式与Python语法
-$env:PYTHONUTF8='1'
-python $env:USERPROFILE\.codex\skills\skill-creator\scripts\quick_validate.py healthy-fitness-coach
-Get-ChildItem healthy-fitness-coach\scripts\*.py,healthy-fitness-coach-plugin\scripts\*.py | ForEach-Object { python -m py_compile $_.FullName }
+npm --prefix healthy-fitness-coach-plugin/mcp/xunji ci --ignore-scripts
+npm --prefix quality-tests ci --ignore-scripts
+python -m pip install Pillow==10.2.0
+npm --prefix quality-tests test
 ```
 
-## 质量指标
+同一入口检查源码测试、Gherkin、关键变异、训练知识与工作流、SVG/PNG、视觉等价、Plugin 同步、配对评测和制品。源码测试有跳过或未决项时失败。解包验证只允许 `build-release.py` 中具名的独立 Skill 跨包例外，并在源码环境验证对应测试。
 
-- 单元/集成测试：必须全部通过，禁止跳过和未决状态
-- Gherkin：6个关键业务场景全部通过（缓存幂等、年度热力图边界、写回同日校验、视觉配方差异、派生层真实性、多图保留）
-- 变异测试：关键阈值和主动作聚合变异必须被测试杀死，目标100%
-- 知识库完整性：来源卡编号连续且训练领域矩阵覆盖有氧、阻力/无氧、功率、间歇与混合训练
-- 长期训练系统：训练DNA参考、四份默认资产和三份按需模板必须存在，入口路由与事实/推断边界必须可审计
-- 视觉编译器：12个配方×3个比例的SVG全部可渲染，12个配方的PNG逐一冒烟，推荐的3个配方构图语法不同，Plugin与独立Skill副本一致
-- 训练闭环：指导输出必须包含事实、判断、行动和下一次验证；训练总结必须显式标记空数据、缺失日期和混合新鲜度
-- 覆盖率：使用Node内置V8覆盖率；当前门禁记录行、分支、函数覆盖率
-- 视觉QA：1:1、9:16、3:4均生成SVG/PNG；像素尺寸、SVG视窗边界、热力图对齐和空数据降级均校验
-- 安全检查：源码与Git跟踪文件不得出现真实API-Key、Bearer凭据、个人训练缓存或导出报告
-- 发布检查：`SKILL.md`格式校验通过，`.skill`压缩包可生成且不含`evals`、`node_modules`、缓存或密钥
+## 覆盖率
 
-变异工具（如Stryker、mutmut）未作为运行时依赖引入；`run-mutation-smoke.js`使用临时副本执行确定性变异探针，保持普通用户安装零额外依赖。
+c8 从 V8 收集 JavaScript 覆盖率。统计独立 Skill 的 `references/`、`scripts/` 和训记连接器的 `src/`，包括范围内未加载的文件。测试、评测、镜像、快照、第三方依赖和 Python 文件不进入分母。
+
+| 源码范围 | 行 | 分支 | 函数 |
+| --- | ---: | ---: | ---: |
+| 独立 Skill | 97.06% | 80.51% | 98.34% |
+| 训记连接器 | 80.40% | 76.47% | 78.07% |
+
+门槛取自干净的 `0483860` 源码测试基线，向下保留两位小数。两套 Node 版本测得同一基线。CI 另按 PR 目标提交或推送前提交核查改动，改动行覆盖率至少 95%，起点位于改动行上的 V8 分支覆盖率至少 90%。本地可指定同一个基准复现。
+
+```powershell
+$env:QUALITY_BASE_SHA = git rev-parse origin/main
+node quality-tests/run-coverage.js
+```
+
+## 验收与变异
+
+`run-gherkin.js` 用 Cucumber 解析功能文件，绑定步骤定义，逐步检查执行结果。歧义、未绑定、跳过、未完成或断言失败均阻断。
+
+`run-mutation-smoke.js` 在独立进程运行原始对照，再替换单个源码片段，沿真实模块路径加载依赖。所有关键变异都必须触发行为断言失败。超时、语法、加载、执行异常和未匹配的替换均视为门禁故障。
+## 历史评测与制品
+
+CI 从固定 Git 提交重建历史 Skill，以清单校验路径、SHA-256 和隐私边界。评测需要完整 Git 历史。运行 `node healthy-fitness-coach/evals/paired-evaluation.js` 可在 `output/paired-evaluation/` 生成原始结果与人工审阅页。加 `--check` 时只执行断言。
+
+发布构建会从 Skill 源同步 Plugin，报告 Git 基线、工作树状态和各发行件 SHA-256。中文图片标题检查要求构建环境具备 CJK 字体，可通过渲染器的字体环境变量指定。

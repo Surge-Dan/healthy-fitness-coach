@@ -2,11 +2,13 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
 const root = path.resolve(__dirname, '..', '..');
 const { buildPairedEvaluation, writePairedEvaluationArtifacts } = require('../evals/paired-evaluation.js');
+const { withBaseline } = require('../evals/baseline.js');
 
 test('creates an auditable static comparison for precisely evals 13 through 18', () => {
   const result = buildPairedEvaluation({ root });
@@ -23,18 +25,21 @@ test('creates an auditable static comparison for precisely evals 13 through 18',
 
 for (const failureMode of ['missing file', 'missing fragment', 'nested missing file']) {
 test(`marks JSON and HTML failed for ${failureMode}`, () => {
-  const fixtureRoot = fs.mkdtempSync(path.join(__dirname, 'paired-evaluation-missing-'));
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'paired-evaluation-missing-'));
   const current = path.join(fixtureRoot, 'healthy-fitness-coach');
-  const baseline = path.join(fixtureRoot, 'healthy-fitness-coach-workspace', 'training-os-redesign', 'skill-snapshot');
+  const baseline = path.join(fixtureRoot, 'baseline');
   try {
     fs.mkdirSync(path.join(current, 'evals'), { recursive: true });
     fs.mkdirSync(path.join(current, 'references'), { recursive: true });
     fs.mkdirSync(path.join(baseline, 'evals'), { recursive: true });
     fs.mkdirSync(path.join(baseline, 'references'), { recursive: true });
     fs.copyFileSync(path.join(root, 'healthy-fitness-coach', 'evals', 'evals.json'), path.join(current, 'evals', 'evals.json'));
-    fs.copyFileSync(path.join(root, 'healthy-fitness-coach-workspace', 'training-os-redesign', 'skill-snapshot', 'evals', 'evals.json'), path.join(baseline, 'evals', 'evals.json'));
     fs.copyFileSync(path.join(root, 'healthy-fitness-coach', 'references', 'training-dna-engine.js'), path.join(current, 'references', 'training-dna-engine.js'));
-    fs.copyFileSync(path.join(root, 'healthy-fitness-coach-workspace', 'training-os-redesign', 'skill-snapshot', 'references', 'training-dna-engine.js'), path.join(baseline, 'references', 'training-dna-engine.js'));
+    withBaseline(root, (directory) => {
+      for (const relative of ['evals/evals.json', 'references/training-dna-engine.js']) {
+        fs.copyFileSync(path.join(directory, relative), path.join(baseline, relative));
+      }
+    });
 
     if (failureMode === 'missing fragment') {
       fs.writeFileSync(path.join(current, 'references', 'assessment.md'), 'Synthetic assessment without required contract.');
@@ -44,7 +49,7 @@ test(`marks JSON and HTML failed for ${failureMode}`, () => {
       fs.mkdirSync(path.join(current, 'assets'), { recursive: true });
       fs.writeFileSync(path.join(current, 'assets', 'athlete-profile-template.md'), 'Synthetic profile');
     }
-    const output = writePairedEvaluationArtifacts({ root: fixtureRoot });
+    const output = writePairedEvaluationArtifacts({ root: fixtureRoot, baselineDirectory: baseline });
     const result = JSON.parse(fs.readFileSync(output.results_path, 'utf8'));
     const assertionId = failureMode === 'nested missing file' ? 'complete_profile_and_plan_assets' : 'simple_question_contract';
     const entry = result.cases.flatMap((item) => item.static_assertions).find((item) => item.id === assertionId);
@@ -68,7 +73,9 @@ test(`marks JSON and HTML failed for ${failureMode}`, () => {
 }
 
 test('writes a self-contained review page and results without secrets, personal data, or photos', () => {
-  const output = writePairedEvaluationArtifacts({ root });
+  const outputDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'fitness-paired-eval-'));
+  try {
+  const output = writePairedEvaluationArtifacts({ root, outputDirectory });
   const resultText = fs.readFileSync(output.results_path, 'utf8');
   const page = fs.readFileSync(output.review_page_path, 'utf8');
   const blocked = /(?:api[_ -]?key|secret|access[_ -]?token|private[_ -]?key|data:image|<img\b)/iu;
@@ -80,4 +87,10 @@ test('writes a self-contained review page and results without secrets, personal 
   assert.doesNotMatch(resultText, blocked);
   assert.doesNotMatch(page, blocked);
   assert.equal(path.extname(output.review_page_path), '.html');
+  writePairedEvaluationArtifacts({ root, outputDirectory, check: true });
+  fs.appendFileSync(output.results_path, '\n');
+  assert.throws(() => writePairedEvaluationArtifacts({ root, outputDirectory, check: true }), /Stale paired evaluation/);
+  } finally {
+    fs.rmSync(outputDirectory, { recursive: true, force: true });
+  }
 });

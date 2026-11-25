@@ -9,7 +9,7 @@ Feature: Healthy Fitness Coach quality gates
   Scenario: Annual heatmap stays inside its SVG viewport
     Given training dates spanning 2026-01-01 to 2026-12-31
     When an annual training heatmap is rendered
-    Then every heatmap cell is inside the viewport
+    Then all 365 heatmap cells are inside the viewport
 
   Scenario: Write-back rejects mixed training dates
     Given write-back rows from two different dates
@@ -19,7 +19,7 @@ Feature: Healthy Fitness Coach quality gates
   Scenario: A single photo receives three structurally different recipes
     Given one local fitness photo with observed visual facts
     When the visual brief is compiled
-    Then three recommendations use three different composition grammars
+    Then 3 recommendations use different composition grammars
 
   Scenario: A derived art layer cannot invent training facts
     Given a traceable fitness motif from the source photo
@@ -27,6 +27,6 @@ Feature: Healthy Fitness Coach quality gates
     Then text numbers logos and invented achievements are forbidden
 
   Scenario: Multiple photos remain present in the training storyboard
-    Given three local fitness photos
+    Given 3 local fitness photos
     When a multi-photo storyboard is rendered
-    Then all three originals are present in separate narrative panels
+    Then all 3 originals are present in separate narrative panels

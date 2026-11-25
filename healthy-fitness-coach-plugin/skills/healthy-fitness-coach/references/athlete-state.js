@@ -64,16 +64,27 @@ function sanitizeSimpleValue(field, value) {
 
 function sanitizeSafetyFlags(value) {
   if (Array.isArray(value)) {
-    const sanitized = value.map((entry) => {
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return sanitizeScalar(entry);
-      const code = sanitizeScalar(entry.code);
-      return code === undefined ? undefined : { code };
-    }).filter((entry) => entry !== undefined);
+    const sanitized = value.map(sanitizeSafetyFlags).filter((entry) => entry !== undefined);
     return sanitized.length > 0 ? sanitized : undefined;
   }
   if (value && typeof value === 'object') {
     const code = sanitizeScalar(value.code);
-    return code === undefined ? undefined : { code };
+    if (code !== undefined) {
+      return typeof value.present === 'boolean' ? { code, present: value.present } : { code };
+    }
+    const flags = Object.fromEntries(Object.entries(value).filter(([, present]) => typeof present === 'boolean'));
+    return Object.keys(flags).length ? flags : undefined;
+  }
+  return sanitizeScalar(value);
+}
+
+function sanitizeSymptomValue(value) {
+  if (Array.isArray(value)) {
+    const clean = value.map(sanitizeSymptomValue).filter((entry) => entry !== undefined);
+    return clean.length > 0 ? clean : undefined;
+  }
+  if (value && typeof value === 'object') {
+    return value.present === false ? undefined : sanitizeScalar(value.description ?? value.code);
   }
   return sanitizeScalar(value);
 }
@@ -87,15 +98,16 @@ function sanitizeSafetyValue(value) {
       if (flags !== undefined) sanitized[key] = flags;
     }
   }
+  for (const key of ['symptoms', 'pain']) {
+    const reported = sanitizeSymptomValue(value[key]);
+    if (reported !== undefined) sanitized[key] = reported;
+  }
   return Object.keys(sanitized).length > 0 ? sanitized : undefined;
 }
 
 function sanitizeCurrentStateValue(field, value) {
   if (field === 'red_flags' || field === 'redFlags') return sanitizeSafetyFlags(value);
-  if (field === 'symptoms' && Array.isArray(value)) {
-    const sanitized = value.map(sanitizeScalar).filter((entry) => entry !== undefined);
-    return sanitized.length > 0 ? sanitized : undefined;
-  }
+  if (field === 'symptoms' || field === 'pain') return sanitizeSymptomValue(value);
   return field === 'safety' ? sanitizeSafetyValue(value) : sanitizeSimpleValue(field, value);
 }
 
